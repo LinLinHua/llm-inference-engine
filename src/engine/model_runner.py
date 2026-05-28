@@ -148,7 +148,7 @@ def _patched_forward(
 
     # ── Step 5: Output projection ─────────────────────────────────────────────
     attn_out = attn_out.transpose(1, 2).contiguous().view(B, seq_q, Hq * D)
-    return self.o_proj(attn_out), None, new_past_kv
+    return self.o_proj(attn_out), new_past_kv
 
 
 def _flash_decode(Q, K, V):
