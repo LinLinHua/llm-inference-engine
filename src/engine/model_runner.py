@@ -1,12 +1,5 @@
 """
 Step 2: Patches HuggingFace attention layers with custom kernels.
-
-Keeps all HuggingFace weights intact:
-  - Embedding, MLP, RMSNorm, LM head → unchanged
-  
-Only replaces attention computation:
-  - Prefill: FA-2 CUDA kernel → fallback to SDPA
-  - Decode:  Triton FlashDecoding → fallback to SDPA
 """
 
 import torch
@@ -15,10 +8,6 @@ from src.engine.base_engine import BaseEngine, GenerationResult
 
 
 class ModelRunner(BaseEngine):
-    """
-    Extends BaseEngine with custom kernel support.
-    Patches attention layers to use FA-2 and FlashDecoding.
-    """
 
     def __init__(
         self,
@@ -41,7 +30,6 @@ class ModelRunner(BaseEngine):
             self._patch_attention_layers()
 
     def _load_cuda_kernel(self):
-        """JIT compile FA-2 CUDA kernel."""
         try:
             import torch.utils.cpp_extension as cpp_ext
             import os
@@ -61,7 +49,6 @@ class ModelRunner(BaseEngine):
             print(f"  → Falling back to PyTorch SDPA")
 
     def _patch_attention_layers(self):
-        """Replace each attention layer's forward with our custom version."""
         for layer_idx, layer in enumerate(self.model.model.layers):
             attn = layer.self_attn
             attn._use_flash_attn   = self.use_flash_attn
@@ -70,17 +57,20 @@ class ModelRunner(BaseEngine):
             attn._layer_id         = layer_idx
             attn._paged_kv_cache   = None
             attn._request_id       = 0
+            # added the shape info, fixed the huggingface version problem
+            attn._Hq               = self.num_heads
+            attn._Hkv              = self.num_kv_heads
+            attn._D                = self.head_dim
             attn.forward           = _patched_forward.__get__(attn, type(attn))
         print(f"  [{len(self.model.model.layers)} layers patched] ✓")
 
     def set_paged_kv_cache(self, paged_kv, request_id: int = 0):
-        """Attach a PagedKVCache to all attention layers."""
         for layer in self.model.model.layers:
             layer.self_attn._paged_kv_cache = paged_kv
             layer.self_attn._request_id     = request_id
 
 
-# ── Helper functions (outside class) ─────────────────────────────────────────
+# ── Helper functions ──────────────────────────────────────────────────────────
 
 def _patched_forward(
     self,
@@ -100,9 +90,9 @@ def _patched_forward(
     K = self.k_proj(hidden_states)
     V = self.v_proj(hidden_states)
 
-    Hq  = self.num_heads
-    Hkv = self.num_key_value_heads
-    D   = self.head_dim
+    Hq  = self._Hq
+    Hkv = self._Hkv
+    D   = self._D
 
     Q = Q.view(B, seq_q, Hq,  D).transpose(1, 2)
     K = K.view(B, seq_q, Hkv, D).transpose(1, 2)
@@ -118,19 +108,19 @@ def _patched_forward(
         V = torch.cat([past_key_value[1], V], dim=2)
     new_past_kv = (K, V) if use_cache else None
 
-    # ── Step 3b: Write new token into PagedKVCache ───────────────────────────
+    # ── Step 3b: Write into PagedKVCache ────────────────────────────────────
     paged_kv   = getattr(self, "_paged_kv_cache", None)
     request_id = getattr(self, "_request_id", 0)
     layer_id   = getattr(self, "_layer_id", 0)
-    seq_pos    = K.shape[2] - 1   # position of the newest token
+    seq_pos    = K.shape[2] - 1
 
     if paged_kv is not None:
         paged_kv.write_kv(
             request_id=request_id,
             layer_id=layer_id,
             token_pos=seq_pos,
-            k=K[0, :, seq_pos, :],   # [Hkv, D]
-            v=V[0, :, seq_pos, :],   # [Hkv, D]
+            k=K[0, :, seq_pos, :],
+            v=V[0, :, seq_pos, :],
         )
 
     # ── Step 4: Choose kernel ────────────────────────────────────────────────
@@ -155,7 +145,6 @@ def _patched_forward(
 
 
 def _flash_decode(Q, K, V):
-    """Call Triton FlashDecoding kernel, fallback to SDPA."""
     try:
         from src.kernels.triton.flash_decode import flash_decode
         return flash_decode(Q, K, V, causal=True)
@@ -168,7 +157,6 @@ def _flash_decode(Q, K, V):
 
 
 def _apply_rope(Q, K, cos, sin):
-    """Apply Rotary Position Embeddings to Q and K."""
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
