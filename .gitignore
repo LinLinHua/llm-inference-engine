@@ -1,0 +1,10 @@
+.DS_Store
+.hf_home/
+.venv-backups/
+__pycache__/
+*.pyc
+*.so
+build/
+results/
+*.ncu-rep
+*.nsys-rep
