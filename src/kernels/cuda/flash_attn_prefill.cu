@@ -15,9 +15,13 @@ Key optimizations vs naive attention:
   5. GQA support        → kv_head = q_head / group_size
 
 HBM traffic: O(N×D) vs O(N²) for naive attention
+
+Note: torch/extension.h must NOT be included in .cu files.
+      Use ATen/ATen.h instead. Python bindings go in the .cpp file.
+      Reference: https://pytorch.org/docs/stable/cpp_extension.html
 */
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -184,14 +188,14 @@ __global__ void fa2_prefill_kernel(
     }
 }
 
-// ── PyTorch wrapper ────────────────────────────────────────────────────────
-torch::Tensor fa2_prefill(
-    torch::Tensor Q,
-    torch::Tensor K,
-    torch::Tensor V,
+// ── C++ wrapper ────────────────────────────────────────────────────────────
+at::Tensor fa2_prefill(
+    at::Tensor Q,
+    at::Tensor K,
+    at::Tensor V,
     bool causal
 ) {
-    TORCH_CHECK(Q.is_cuda() && Q.dtype() == torch::kFloat16);
+    TORCH_CHECK(Q.is_cuda() && Q.dtype() == at::kHalf);
     int B   = Q.size(0);
     int Hq  = Q.size(1);
     int Sq  = Q.size(2);
@@ -200,7 +204,7 @@ torch::Tensor fa2_prefill(
     int Skv = K.size(2);
     TORCH_CHECK(D == 128, "head_dim must be 128");
 
-    auto O      = torch::zeros_like(Q);
+    auto O      = at::zeros_like(Q);
     float scale = 1.f / sqrtf((float)D);
 
     dim3 grid((Sq + BR - 1) / BR, Hq, B);
