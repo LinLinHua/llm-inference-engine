@@ -99,8 +99,15 @@ def _patched_forward(
     V = V.view(B, seq_q, Hkv, D).transpose(1, 2)
 
     # ── Step 2: Rotary embeddings ────────────────────────────────────────────
-    cos, sin = self.rotary_emb(V, position_ids)
-    Q, K = _apply_rope(Q, K, cos, sin)
+    try:
+        cos, sin = self.rotary_emb(V, position_ids)
+        Q, K = _apply_rope(Q, K, cos, sin)
+    except AttributeError:
+        # Newer HuggingFace versions handle RoPE differently
+        # Use cache_position if available
+        if cache_position is not None:
+            cos, sin = self.rotary_emb(V, position_ids=cache_position.unsqueeze(0))
+            Q, K = _apply_rope(Q, K, cos, sin)
 
     # ── Step 3: Append to HuggingFace KV cache ──────────────────────────────
     if past_key_value is not None:
