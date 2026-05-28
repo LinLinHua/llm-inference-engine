@@ -19,7 +19,7 @@ HBM traffic: O(N×D) vs O(N²) for naive attention
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <float.h>
 
 using namespace nvcuda;
@@ -228,11 +228,4 @@ torch::Tensor fa2_prefill(
         B, Hq, Hkv, Sq, Skv, scale, causal
     );
     return O;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fa2_prefill", &fa2_prefill,
-          "FlashAttention-2 prefill kernel (CUDA, Tensor Core, GQA)",
-          py::arg("Q"), py::arg("K"), py::arg("V"),
-          py::arg("causal") = true);
 }

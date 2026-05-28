@@ -42,7 +42,7 @@ class ModelRunner(BaseEngine):
             )
             self._cuda_ext = cpp_ext.load(
                 name="flash_attn_prefill",
-                sources=[src],
+                sources=[os.path.join(base, "flash_attn_prefill_bind.cpp"),os.path.join(base, "flash_attn_prefill.cu"),],
                 extra_cuda_cflags=["-O2", "--use_fast_math", "-arch=sm_80"],
                 verbose=False,
             )
