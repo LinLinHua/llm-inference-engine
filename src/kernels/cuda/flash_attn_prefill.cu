@@ -3,19 +3,6 @@ src/kernels/cuda/flash_attn_prefill.cu
 
 FlashAttention-2 Prefill Kernel (CUDA, Tensor Core, GQA)
 =========================================================
-Used during prefill phase: Q, K, V all have seq_len = prompt length.
-
-Key optimizations vs naive attention:
-  1. Online softmax     → no N×N matrix written to HBM
-  2. SRAM tiling        → Q/K/V tiles fit in shared memory
-  3. Tensor Core MMA    → wmma fp16 → fp32, much faster than CUDA cores
-  4. FA-2 loop order    → outer=Q blocks, inner=KV blocks
-                          each thread block owns one Q tile
-                          O_acc stays in register, written to HBM only once
-  5. GQA support        → kv_head = q_head / group_size
-
-HBM traffic: O(N×D) vs O(N²) for naive attention
-
 Note: torch/extension.h must NOT be included in .cu files.
       Use ATen/ATen.h instead. Python bindings go in the .cpp file.
       Reference: https://pytorch.org/docs/stable/cpp_extension.html
@@ -30,13 +17,20 @@ Note: torch/extension.h must NOT be included in .cu files.
 
 using namespace nvcuda;
 
-#define BR     32
-#define BC     32
-#define HD    128
+#define BR     32    // Q tile rows  (2 warps × WMMA_M=16)
+#define BC     32    // KV tile rows
+#define HD    128    // head_dim
 
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
+
+// shared memory usage:
+// Q_smem: 32×128×2 = 8KB
+// K_smem: 32×128×2 = 8KB
+// V_smem: 32×128×2 = 8KB
+// S_smem: 32×32×4  = 4KB
+// total: 28KB < 48KB limit
 
 __global__ void fa2_prefill_kernel(
     const __half* __restrict__ Q,
@@ -51,18 +45,19 @@ __global__ void fa2_prefill_kernel(
     int b       = blockIdx.z;
     int kv_h    = h / (Hq / Hkv);
 
-    int warp_id = threadIdx.x / 32;
+    int warp_id = threadIdx.x / 32;  // 0 or 1 (2 warps)
     int lane_id = threadIdx.x % 32;
     int tid     = threadIdx.x;
 
     int q_start = q_block * BR;
     if (q_start >= Sq) return;
 
-    __shared__ __half Q_smem[BR][HD];
-    __shared__ __half K_smem[BC][HD];
-    __shared__ __half V_smem[BC][HD];
-    __shared__ float  S_smem[BR][BC];
+    __shared__ __half Q_smem[BR][HD];  // 32×128
+    __shared__ __half K_smem[BC][HD];  // 32×128
+    __shared__ __half V_smem[BC][HD];  // 32×128
+    __shared__ float  S_smem[BR][BC];  // 32×32
 
+    // Load Q tile
     for (int idx = tid; idx < BR * HD; idx += blockDim.x) {
         int r  = idx / HD;
         int c  = idx % HD;
@@ -73,11 +68,12 @@ __global__ void fa2_prefill_kernel(
     }
     __syncthreads();
 
+    // warp_row_start: warp 0 → row 0, warp 1 → row 16
     int warp_row_start = warp_id * WMMA_M;
 
     float m_i[WMMA_M];
     float l_i[WMMA_M];
-    float O_acc[WMMA_M][4];
+    float O_acc[WMMA_M][4];  // each thread owns HD/32=4 cols
 
     for (int r = 0; r < WMMA_M; r++) {
         m_i[r] = -FLT_MAX;
@@ -92,6 +88,7 @@ __global__ void fa2_prefill_kernel(
 
         if (causal && kv_start > q_start + BR - 1) break;
 
+        // Load K tile
         for (int idx = tid; idx < BC * HD; idx += blockDim.x) {
             int r  = idx / HD;
             int c  = idx % HD;
@@ -101,6 +98,7 @@ __global__ void fa2_prefill_kernel(
                 __float2half(0.f);
         }
 
+        // Load V tile
         for (int idx = tid; idx < BC * HD; idx += blockDim.x) {
             int r  = idx / HD;
             int c  = idx % HD;
@@ -111,11 +109,14 @@ __global__ void fa2_prefill_kernel(
         }
         __syncthreads();
 
+        // Tensor Core GEMM: S[BR,BC] = Q_smem @ K_smem^T
+        // nc loop: BC/WMMA_N = 32/16 = 2 iterations
         for (int nc = 0; nc < BC / WMMA_N; nc++) {
             wmma::fragment<wmma::accumulator,
                 WMMA_M, WMMA_N, WMMA_K, float> acc;
             wmma::fill_fragment(acc, 0.f);
 
+            // dk loop: HD/WMMA_K = 128/16 = 8 iterations
             for (int dk = 0; dk < HD; dk += WMMA_K) {
                 wmma::fragment<wmma::matrix_a,
                     WMMA_M, WMMA_N, WMMA_K, __half,
@@ -131,12 +132,14 @@ __global__ void fa2_prefill_kernel(
                 wmma::mma_sync(acc, q_frag, k_frag, acc);
             }
 
+            // store to S_smem[warp_row_start..+16][nc*16..+16]
             wmma::store_matrix_sync(
                 &S_smem[warp_row_start][nc * WMMA_N],
                 acc, BC, wmma::mem_row_major);
         }
         __syncthreads();
 
+        // Online softmax + O_acc update
         for (int r = 0; r < WMMA_M; r++) {
             int global_i = q_start + warp_row_start + r;
             if (global_i >= Sq) continue;
@@ -161,8 +164,9 @@ __global__ void fa2_prefill_kernel(
                 l_tile += S_smem[warp_row_start + r][jj];
             }
 
+            // each thread handles 4 cols: lane_id, lane_id+32, lane_id+64, lane_id+96
             for (int di = 0; di < 4; di++) {
-                int d = lane_id + di * 32;
+                int d = lane_id + di * 32;  // max = 31 + 3*32 = 127 < HD=128
                 float v_acc = 0.f;
                 for (int jj = 0; jj < BC; jj++)
                     v_acc += S_smem[warp_row_start + r][jj] *
@@ -176,6 +180,7 @@ __global__ void fa2_prefill_kernel(
         __syncthreads();
     }
 
+    // Write output to HBM
     for (int r = 0; r < WMMA_M; r++) {
         int global_i = q_start + warp_row_start + r;
         if (global_i >= Sq || l_i[r] == 0.f) continue;
@@ -208,7 +213,7 @@ at::Tensor fa2_prefill(
     float scale = 1.f / sqrtf((float)D);
 
     dim3 grid((Sq + BR - 1) / BR, Hq, B);
-    dim3 block(128);
+    dim3 block(64);  // 2 warps × 32 threads, matches BR=32
 
     fa2_prefill_kernel<<<grid, block>>>(
         reinterpret_cast<const __half*>(Q.data_ptr()),
