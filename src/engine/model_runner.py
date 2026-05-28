@@ -75,47 +75,48 @@ class ModelRunner(BaseEngine):
 def _patched_forward(
     self,
     hidden_states,
-    attention_mask=    None,
-    position_ids=      None,
-    past_key_value=    None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_value=None,
     output_attentions: bool = False,
-    use_cache:         bool = True,
-    cache_position=    None,
+    use_cache: bool = True,
+    cache_position=None,
+    position_embeddings=None,  # new in transformers >= 4.46
     **kwargs,
 ):
     B, seq_q, _ = hidden_states.shape
+    Hq  = self._Hq
+    Hkv = self._Hkv
+    D   = self._D
+    g   = Hq // Hkv
 
     # ── Step 1: QKV projection ───────────────────────────────────────────────
     Q = self.q_proj(hidden_states)
     K = self.k_proj(hidden_states)
     V = self.v_proj(hidden_states)
 
-    Hq  = self._Hq
-    Hkv = self._Hkv
-    D   = self._D
-
     Q = Q.view(B, seq_q, Hq,  D).transpose(1, 2)
     K = K.view(B, seq_q, Hkv, D).transpose(1, 2)
     V = V.view(B, seq_q, Hkv, D).transpose(1, 2)
 
-    # ── Step 2: Rotary embeddings ────────────────────────────────────────────
-    try:
+    # ── Step 2: RoPE ─────────────────────────────────────────────────────────
+    if position_embeddings is not None:
+        # New HuggingFace (>= 4.46): cos/sin passed in directly
+        cos, sin = position_embeddings
+        Q, K = _apply_rope(Q, K, cos, sin)
+    elif hasattr(self, "rotary_emb"):
+        # Old HuggingFace: rotary_emb lives in attention layer
         cos, sin = self.rotary_emb(V, position_ids)
         Q, K = _apply_rope(Q, K, cos, sin)
-    except AttributeError:
-        # Newer HuggingFace versions handle RoPE differently
-        # Use cache_position if available
-        if cache_position is not None:
-            cos, sin = self.rotary_emb(V, position_ids=cache_position.unsqueeze(0))
-            Q, K = _apply_rope(Q, K, cos, sin)
+    # else: no RoPE available, skip
 
-    # ── Step 3: Append to HuggingFace KV cache ──────────────────────────────
+    # ── Step 3: KV cache ─────────────────────────────────────────────────────
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim=2)
         V = torch.cat([past_key_value[1], V], dim=2)
     new_past_kv = (K, V) if use_cache else None
 
-    # ── Step 3b: Write into PagedKVCache ────────────────────────────────────
+    # ── Step 3b: Write into PagedKVCache ─────────────────────────────────────
     paged_kv   = getattr(self, "_paged_kv_cache", None)
     request_id = getattr(self, "_request_id", 0)
     layer_id   = getattr(self, "_layer_id", 0)
@@ -130,10 +131,9 @@ def _patched_forward(
             v=V[0, :, seq_pos, :],
         )
 
-    # ── Step 4: Choose kernel ────────────────────────────────────────────────
+    # ── Step 4: Attention ─────────────────────────────────────────────────────
     is_decode = (seq_q == 1)
     cuda_ext  = getattr(self, "_cuda_ext", None)
-    g         = Hq // Hkv
 
     if is_decode and getattr(self, "_use_flash_decode", False):
         attn_out = _flash_decode(Q, K, V)
@@ -146,7 +146,7 @@ def _patched_forward(
             Q, K_exp, V_exp, is_causal=(seq_q > 1)
         )
 
-    # ── Step 5: Output projection ────────────────────────────────────────────
+    # ── Step 5: Output projection ─────────────────────────────────────────────
     attn_out = attn_out.transpose(1, 2).contiguous().view(B, seq_q, Hq * D)
     return self.o_proj(attn_out), None, new_past_kv
 
