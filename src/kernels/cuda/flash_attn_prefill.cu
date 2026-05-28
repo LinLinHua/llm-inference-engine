@@ -17,11 +17,11 @@ Key optimizations vs naive attention:
 HBM traffic: O(N×D) vs O(N²) for naive attention
 */
 
+#include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
-#include <ATen/ATen.h>
 #include <float.h>
 
 using namespace nvcuda;
@@ -184,14 +184,14 @@ __global__ void fa2_prefill_kernel(
     }
 }
 
-// ── C++ wrapper (uses ATen, not torch/extension.h) ─────────────────────────
-at::Tensor fa2_prefill(
-    at::Tensor Q,
-    at::Tensor K,
-    at::Tensor V,
+// ── PyTorch wrapper ────────────────────────────────────────────────────────
+torch::Tensor fa2_prefill(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
     bool causal
 ) {
-    TORCH_CHECK(Q.is_cuda() && Q.dtype() == at::kHalf);
+    TORCH_CHECK(Q.is_cuda() && Q.dtype() == torch::kFloat16);
     int B   = Q.size(0);
     int Hq  = Q.size(1);
     int Sq  = Q.size(2);
@@ -200,7 +200,7 @@ at::Tensor fa2_prefill(
     int Skv = K.size(2);
     TORCH_CHECK(D == 128, "head_dim must be 128");
 
-    auto O      = at::zeros_like(Q);
+    auto O      = torch::zeros_like(Q);
     float scale = 1.f / sqrtf((float)D);
 
     dim3 grid((Sq + BR - 1) / BR, Hq, B);

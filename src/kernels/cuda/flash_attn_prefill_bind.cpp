@@ -1,19 +1,10 @@
-/*
-src/kernels/cuda/flash_attn_prefill_bind.cpp
-
-Python binding for FlashAttention-2 prefill kernel.
-Separated from .cu file per official PyTorch docs:
-  torch/extension.h should NOT be parsed by nvcc.
-Reference: https://pytorch.org/docs/stable/cpp_extension.html
-*/
-
 #include <torch/extension.h>
 
-// Forward declaration (defined in flash_attn_prefill.cu)
-at::Tensor fa2_prefill(
-    at::Tensor Q,
-    at::Tensor K,
-    at::Tensor V,
+// Forward declaration — defined in flash_attn_prefill.cu
+torch::Tensor fa2_prefill(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
     bool causal
 );
 
