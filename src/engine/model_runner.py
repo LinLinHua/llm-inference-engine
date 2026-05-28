@@ -1,12 +1,13 @@
 """
-src/engine/model_runner.py
-
 Step 2: Patches HuggingFace attention layers with custom kernels.
+Follows official LlamaAttention.forward signature exactly.
+Reference: transformers/src/transformers/models/llama/modeling_llama.py
 """
 
 import torch
 import torch.nn.functional as F
-from src.engine.base_engine import BaseEngine, GenerationResult
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+from src.engine.base_engine import BaseEngine
 
 
 class ModelRunner(BaseEngine):
@@ -59,10 +60,8 @@ class ModelRunner(BaseEngine):
             attn._layer_id         = layer_idx
             attn._paged_kv_cache   = None
             attn._request_id       = 0
-            # Store shape info to avoid HuggingFace version differences
             attn._Hq               = self.num_heads
             attn._Hkv              = self.num_kv_heads
-            attn._D                = self.head_dim
             attn.forward           = _patched_forward.__get__(attn, type(attn))
         print(f"  [{len(self.model.model.layers)} layers patched] ✓")
 
@@ -77,97 +76,70 @@ class ModelRunner(BaseEngine):
 def _patched_forward(
     self,
     hidden_states,
+    position_embeddings=None,
     attention_mask=None,
-    position_ids=None,
-    past_key_value=None,
-    output_attentions: bool = False,
-    use_cache: bool = True,
+    past_key_values=None,
     cache_position=None,
-    position_embeddings=None,  # (cos, sin) passed in from HuggingFace >= 4.46
     **kwargs,
 ):
-    B, seq_q, _ = hidden_states.shape
-    Hq  = self._Hq
-    Hkv = self._Hkv
-    D   = self._D
-    g   = Hq // Hkv
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
 
     # ── Step 1: QKV projection ───────────────────────────────────────────────
-    Q = self.q_proj(hidden_states)
-    K = self.k_proj(hidden_states)
-    V = self.v_proj(hidden_states)
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    Q = Q.view(B, seq_q, Hq,  D).transpose(1, 2)  # [B, Hq,  seq_q, D]
-    K = K.view(B, seq_q, Hkv, D).transpose(1, 2)  # [B, Hkv, seq_q, D]
-    V = V.view(B, seq_q, Hkv, D).transpose(1, 2)  # [B, Hkv, seq_q, D]
+    # ── Step 2: RoPE (matches official apply_rotary_pos_emb) ─────────────────
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    # ── Step 2: RoPE ─────────────────────────────────────────────────────────
-    # cos/sin shape: [B, seq_q, D] → unsqueeze(1) → [B, 1, seq_q, D]
-    # Q/K shape:     [B, Hq/Hkv, seq_q, D]
-    # broadcast works because head dim = 1 broadcasts to Hq/Hkv
-    if position_embeddings is not None:
-        cos, sin = position_embeddings
-        cos = cos.unsqueeze(1)  # [B, 1, seq_q, D]
-        sin = sin.unsqueeze(1)
-        Q = (Q * cos) + (_rotate_half(Q) * sin)
-        K = (K * cos) + (_rotate_half(K) * sin)
-    elif hasattr(self, "rotary_emb"):
-        cos, sin = self.rotary_emb(V, position_ids)
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        Q = (Q * cos) + (_rotate_half(Q) * sin)
-        K = (K * cos) + (_rotate_half(K) * sin)
-
-    # ── Step 3: KV cache ─────────────────────────────────────────────────────
-    if past_key_value is not None:
-        K = torch.cat([past_key_value[0], K], dim=2)
-        V = torch.cat([past_key_value[1], V], dim=2)
-    new_past_kv = (K, V) if use_cache else None
+    # ── Step 3: KV cache (matches official DynamicCache.update) ──────────────
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self._layer_id, cache_kwargs
+        )
 
     # ── Step 3b: Write into PagedKVCache ─────────────────────────────────────
     paged_kv   = getattr(self, "_paged_kv_cache", None)
     request_id = getattr(self, "_request_id", 0)
-    layer_id   = getattr(self, "_layer_id", 0)
-    seq_pos    = K.shape[2] - 1
+    seq_pos    = key_states.shape[2] - 1
 
     if paged_kv is not None:
         paged_kv.write_kv(
             request_id=request_id,
-            layer_id=layer_id,
+            layer_id=self._layer_id,
             token_pos=seq_pos,
-            k=K[0, :, seq_pos, :],
-            v=V[0, :, seq_pos, :],
+            k=key_states[0, :, seq_pos, :],
+            v=value_states[0, :, seq_pos, :],
         )
 
-    # ── Step 4: Attention ─────────────────────────────────────────────────────
+    # ── Step 4: Choose kernel ─────────────────────────────────────────────────
+    g         = self._Hq // self._Hkv
+    seq_q     = query_states.shape[2]
     is_decode = (seq_q == 1)
     cuda_ext  = getattr(self, "_cuda_ext", None)
 
     if is_decode and getattr(self, "_use_flash_decode", False):
-        attn_out = _flash_decode(Q, K, V)
+        attn_output = _flash_decode(query_states, key_states, value_states)
     elif not is_decode and cuda_ext is not None and getattr(self, "_use_flash_attn", False):
-        attn_out = cuda_ext.fa2_prefill(Q, K, V, True)
+        attn_output = cuda_ext.fa2_prefill(query_states, key_states, value_states, True)
     else:
-        K_exp    = K.repeat_interleave(g, dim=1)
-        V_exp    = V.repeat_interleave(g, dim=1)
-        attn_out = F.scaled_dot_product_attention(
-            Q, K_exp, V_exp, is_causal=(seq_q > 1)
+        K_exp = key_states.repeat_interleave(g, dim=1)
+        V_exp = value_states.repeat_interleave(g, dim=1)
+        attn_output = F.scaled_dot_product_attention(
+            query_states, K_exp, V_exp, is_causal=(seq_q > 1)
         )
 
-    # ── Step 5: Output projection ─────────────────────────────────────────────
-    attn_out = attn_out.transpose(1, 2).contiguous().view(B, seq_q, Hq * D)
-    return self.o_proj(attn_out), new_past_kv
-
-
-def _rotate_half(x):
-    """Rotates half the hidden dims — matches HuggingFace's rotate_half."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    # ── Step 5: Output projection (matches official reshape) ─────────────────
+    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None  # (attn_output, attn_weights)
 
 
 def _flash_decode(Q, K, V):
-    """Call Triton FlashDecoding kernel, fallback to SDPA."""
+    """Triton FlashDecoding kernel, fallback to SDPA."""
     try:
         from src.kernels.triton.flash_decode import flash_decode
         return flash_decode(Q, K, V, causal=True)
