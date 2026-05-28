@@ -1,4 +1,6 @@
 """
+src/engine/model_runner.py
+
 Step 2: Patches HuggingFace attention layers with custom kernels.
 """
 
@@ -57,7 +59,7 @@ class ModelRunner(BaseEngine):
             attn._layer_id         = layer_idx
             attn._paged_kv_cache   = None
             attn._request_id       = 0
-            # added the shape info, fixed the huggingface version problem
+            # Store shape info to avoid HuggingFace version differences
             attn._Hq               = self.num_heads
             attn._Hkv              = self.num_kv_heads
             attn._D                = self.head_dim
@@ -81,7 +83,7 @@ def _patched_forward(
     output_attentions: bool = False,
     use_cache: bool = True,
     cache_position=None,
-    position_embeddings=None,  # new in transformers >= 4.46
+    position_embeddings=None,  # (cos, sin) passed in from HuggingFace >= 4.46
     **kwargs,
 ):
     B, seq_q, _ = hidden_states.shape
@@ -95,20 +97,26 @@ def _patched_forward(
     K = self.k_proj(hidden_states)
     V = self.v_proj(hidden_states)
 
-    Q = Q.view(B, seq_q, Hq,  D).transpose(1, 2)
-    K = K.view(B, seq_q, Hkv, D).transpose(1, 2)
-    V = V.view(B, seq_q, Hkv, D).transpose(1, 2)
+    Q = Q.view(B, seq_q, Hq,  D).transpose(1, 2)  # [B, Hq,  seq_q, D]
+    K = K.view(B, seq_q, Hkv, D).transpose(1, 2)  # [B, Hkv, seq_q, D]
+    V = V.view(B, seq_q, Hkv, D).transpose(1, 2)  # [B, Hkv, seq_q, D]
 
     # ── Step 2: RoPE ─────────────────────────────────────────────────────────
+    # cos/sin shape: [B, seq_q, D] → unsqueeze(1) → [B, 1, seq_q, D]
+    # Q/K shape:     [B, Hq/Hkv, seq_q, D]
+    # broadcast works because head dim = 1 broadcasts to Hq/Hkv
     if position_embeddings is not None:
-        # New HuggingFace (>= 4.46): cos/sin passed in directly
         cos, sin = position_embeddings
-        Q, K = _apply_rope(Q, K, cos, sin)
+        cos = cos.unsqueeze(1)  # [B, 1, seq_q, D]
+        sin = sin.unsqueeze(1)
+        Q = (Q * cos) + (_rotate_half(Q) * sin)
+        K = (K * cos) + (_rotate_half(K) * sin)
     elif hasattr(self, "rotary_emb"):
-        # Old HuggingFace: rotary_emb lives in attention layer
         cos, sin = self.rotary_emb(V, position_ids)
-        Q, K = _apply_rope(Q, K, cos, sin)
-    # else: no RoPE available, skip
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        Q = (Q * cos) + (_rotate_half(Q) * sin)
+        K = (K * cos) + (_rotate_half(K) * sin)
 
     # ── Step 3: KV cache ─────────────────────────────────────────────────────
     if past_key_value is not None:
@@ -151,7 +159,15 @@ def _patched_forward(
     return self.o_proj(attn_out), new_past_kv
 
 
+def _rotate_half(x):
+    """Rotates half the hidden dims — matches HuggingFace's rotate_half."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
 def _flash_decode(Q, K, V):
+    """Call Triton FlashDecoding kernel, fallback to SDPA."""
     try:
         from src.kernels.triton.flash_decode import flash_decode
         return flash_decode(Q, K, V, causal=True)
@@ -161,20 +177,3 @@ def _flash_decode(Q, K, V):
             Q, K.repeat_interleave(g, 1), V.repeat_interleave(g, 1),
             is_causal=False
         )
-
-
-def _apply_rope(Q, K, cos, sin):
-    def rotate_half(x):
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
-    if cos.dim() == 2:
-        cos = cos.unsqueeze(0).unsqueeze(0)
-        sin = sin.unsqueeze(0).unsqueeze(0)
-    elif cos.dim() == 3:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-
-    Q_rot = Q * cos + rotate_half(Q) * sin
-    K_rot = K * cos + rotate_half(K) * sin
-    return Q_rot, K_rot
