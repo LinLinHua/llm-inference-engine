@@ -30,8 +30,8 @@ Note: torch/extension.h must NOT be included in .cu files.
 
 using namespace nvcuda;
 
-#define BR     64
-#define BC     64
+#define BR     32
+#define BC     32
 #define HD    128
 
 #define WMMA_M 16
